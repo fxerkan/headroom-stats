@@ -1,0 +1,836 @@
+#!/usr/bin/env python3
+"""
+headroom-stats — Terminal dashboard for Headroom token savings.
+
+Usage:
+  headroom-stats              One-shot render (shows last 15 days)
+  headroom-stats --days=30    Show last N days in Daily Breakdown
+  headroom-stats --watch      Auto-refresh every 5 s  (Ctrl-C to quit)
+  headroom-stats --watch=10   Auto-refresh every 10 s
+"""
+
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+from datetime import datetime, date, timedelta, timezone
+from urllib.request import urlopen
+
+# ── Config ────────────────────────────────────────────────────────────────────
+PORT = int(os.environ.get("HEADROOM_PORT", "8787"))
+STATS_URL = f"http://localhost:{PORT}/stats"
+RTK_DB = os.path.expanduser("~/Library/Application Support/rtk/history.db")
+SAVINGS_FILE = os.path.expanduser("~/.headroom/proxy_savings.json")
+MEMORIES_DIR = os.path.expanduser("~/.headroom/memories")
+MEMORY_DB    = os.path.expanduser("~/.headroom/memory.db")
+
+# ── ANSI palette ──────────────────────────────────────────────────────────────
+RST   = "\033[0m"
+BOLD  = "\033[1m"
+DIM   = "\033[2m"
+
+PUR   = "\033[38;5;141m"
+PUR2  = "\033[38;5;99m"
+CYN   = "\033[38;5;81m"
+GRN   = "\033[38;5;83m"
+YEL   = "\033[38;5;227m"
+RED   = "\033[38;5;204m"
+WHT   = "\033[38;5;255m"
+GRY   = "\033[38;5;245m"
+GRY2  = "\033[38;5;237m"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+_ANSI = re.compile(r"\033\[[0-9;]*m")
+
+def vlen(s: str) -> int:
+    return len(_ANSI.sub("", s))
+
+def vpad(s: str, width: int, align: str = "left") -> str:
+    gap = max(0, width - vlen(s))
+    if align == "right":
+        return " " * gap + s
+    if align == "center":
+        l = gap // 2
+        return " " * l + s + " " * (gap - l)
+    return s + " " * gap
+
+def fmt_tok(n: float) -> str:
+    if n >= 1_000_000_000: return f"{n/1e9:.1f}B"
+    if n >= 1_000_000:     return f"{n/1e6:.1f}M"
+    if n >= 1_000:         return f"{n/1e3:.1f}K"
+    return str(int(n))
+
+def fmt_usd(v: float) -> str:
+    if v >= 100_000: return f"${v/1000:.0f}K"
+    if v >= 1_000:   return f"${v/1000:.1f}K"
+    return f"${v:.2f}"
+
+def fmt_pct(v: float) -> str:
+    return f"{v:.1f}%"
+
+def fmt_ms(ms: float) -> str:
+    if ms <= 0:       return "—"
+    if ms < 1_000:    return f"{ms:.0f}ms"
+    if ms < 60_000:   return f"{ms/1000:.1f}s"
+    return f"{ms/60000:.1f}m"
+
+def fmt_ts(ts: str, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    if not ts:
+        return ""
+    is_utc = ts.endswith("Z") or ts.endswith("z")
+    clean = ts.rstrip("Zz")
+    for pat in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+        try:
+            dt = datetime.strptime(clean[:26], pat)
+            break
+        except ValueError:
+            continue
+    else:
+        return ts[:16].replace("T", " ")
+    if is_utc:
+        dt = dt.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+    return dt.strftime(fmt)
+
+def fetch() -> dict | None:
+    try:
+        with urlopen(STATS_URL, timeout=3) as r:
+            return json.load(r)
+    except Exception:
+        return None
+
+def term_width() -> int:
+    try:
+        return os.get_terminal_size().columns
+    except Exception:
+        return 100
+
+# ── Memory ON/OFF detection ───────────────────────────────────────────────────
+def is_memory_on() -> bool:
+    """Check if headroom auto-memory is actually active."""
+    # Check memories directory has project entries
+    if os.path.isdir(MEMORIES_DIR):
+        projects_dir = os.path.join(MEMORIES_DIR, "projects")
+        if os.path.isdir(projects_dir) and os.listdir(projects_dir):
+            return True
+    # Check memory.db has rows
+    if os.path.exists(MEMORY_DB):
+        try:
+            conn = sqlite3.connect(MEMORY_DB)
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()]
+            for t in tables:
+                if conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] > 0:
+                    conn.close()
+                    return True
+            conn.close()
+        except Exception:
+            pass
+    return False
+
+# ── RTK command stats from SQLite ─────────────────────────────────────────────
+def load_rtk_commands(limit: int = 10) -> list[dict]:
+    """Aggregate RTK commands by prefix, sorted by total tokens saved."""
+    if not os.path.exists(RTK_DB):
+        return []
+    try:
+        conn = sqlite3.connect(RTK_DB)
+        rows = conn.execute(
+            "SELECT rtk_cmd, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms "
+            "FROM commands ORDER BY timestamp"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return []
+
+    if not rows:
+        return []
+
+    def cmd_key(cmd: str) -> str:
+        """Truncate long commands for display."""
+        parts = cmd.split()
+        key = " ".join(parts[:4])
+        return key[:40] + ("..." if len(key) > 40 else "")
+
+    agg: dict[str, dict] = {}
+    for rtk_cmd, inp, out, saved, pct, ms in rows:
+        key = cmd_key(rtk_cmd)
+        if key not in agg:
+            agg[key] = {"cmd": key, "count": 0, "saved": 0, "pct_sum": 0, "ms_sum": 0}
+        agg[key]["count"]   += 1
+        agg[key]["saved"]   += saved
+        agg[key]["pct_sum"] += pct
+        agg[key]["ms_sum"]  += ms
+
+    result = []
+    for v in agg.values():
+        v["avg_pct"] = v["pct_sum"] / v["count"] if v["count"] else 0
+        v["avg_ms"]  = v["ms_sum"]  / v["count"] if v["count"] else 0
+        result.append(v)
+
+    result.sort(key=lambda x: x["saved"], reverse=True)
+    return result[:limit]
+
+# ── Savings file parsing ──────────────────────────────────────────────────────
+def _parse_savings_history() -> list[dict]:
+    try:
+        with open(SAVINGS_FILE) as f:
+            raw = json.load(f)
+        return raw.get("history", [])
+    except Exception:
+        return []
+
+def load_daily(days: int) -> dict:
+    """Build {date: {tokens, cost}} for last N days."""
+    hist = _parse_savings_history()
+    if len(hist) < 2:
+        return {}
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    daily: dict = {}
+    for i in range(1, len(hist)):
+        date_str = fmt_ts(hist[i]["timestamp"], "%Y-%m-%d")
+        if date_str < cutoff:
+            continue
+        dt = max(0.0, hist[i]["total_tokens_saved"]      - hist[i-1]["total_tokens_saved"])
+        dc = max(0.0, hist[i]["compression_savings_usd"] - hist[i-1]["compression_savings_usd"])
+        if date_str not in daily:
+            daily[date_str] = {"tokens": 0.0, "cost": 0.0}
+        daily[date_str]["tokens"] += dt
+        daily[date_str]["cost"]   += dc
+    return daily
+
+def load_all_daily() -> dict:
+    """All available daily data (for weekly/monthly aggregation)."""
+    hist = _parse_savings_history()
+    if len(hist) < 2:
+        return {}
+    daily: dict = {}
+    for i in range(1, len(hist)):
+        date_str = fmt_ts(hist[i]["timestamp"], "%Y-%m-%d")
+        dt = max(0.0, hist[i]["total_tokens_saved"]      - hist[i-1]["total_tokens_saved"])
+        dc = max(0.0, hist[i]["compression_savings_usd"] - hist[i-1]["compression_savings_usd"])
+        if date_str not in daily:
+            daily[date_str] = {"tokens": 0.0, "cost": 0.0}
+        daily[date_str]["tokens"] += dt
+        daily[date_str]["cost"]   += dc
+    return daily
+
+def load_savings_chart_data() -> tuple[list[float], list[float], str, str]:
+    """
+    Return (tok_deltas, cost_deltas, start_date, end_date) for chart.
+    Trims leading zero-entries so chart starts at first real activity.
+    """
+    hist = _parse_savings_history()
+    if len(hist) < 2:
+        return [], [], "", ""
+
+    tok_deltas  = [max(0.0, hist[i]["total_tokens_saved"]      - hist[i-1]["total_tokens_saved"])
+                   for i in range(1, len(hist))]
+    cost_deltas = [max(0.0, hist[i]["compression_savings_usd"] - hist[i-1]["compression_savings_usd"])
+                   for i in range(1, len(hist))]
+    timestamps  = [hist[i]["timestamp"] for i in range(1, len(hist))]
+
+    # Trim leading zeros
+    first = next((i for i, v in enumerate(tok_deltas) if v > 0), None)
+    if first is None:
+        return [], [], "", ""
+
+    tok_deltas  = tok_deltas[first:]
+    cost_deltas = cost_deltas[first:]
+    start_date  = fmt_ts(timestamps[first], "%Y-%m-%d")
+    end_date    = fmt_ts(timestamps[-1],    "%Y-%m-%d")
+    return tok_deltas, cost_deltas, start_date, end_date
+
+# ── Weekly / Monthly aggregation ─────────────────────────────────────────────
+def aggregate_weekly(all_daily: dict) -> list[dict]:
+    """Group daily data into ISO weeks."""
+    weeks: dict[str, dict] = {}
+    for date_str, v in all_daily.items():
+        d = datetime.strptime(date_str, "%Y-%m-%d")
+        # Week key: Mon of that week
+        mon = d - timedelta(days=d.weekday())
+        sun = mon + timedelta(days=6)
+        key = f"{mon.strftime('%m-%d')} → {sun.strftime('%m-%d')}"
+        if key not in weeks:
+            weeks[key] = {"label": key, "tokens": 0.0, "cost": 0.0,
+                          "_mon": mon}
+        weeks[key]["tokens"] += v["tokens"]
+        weeks[key]["cost"]   += v["cost"]
+    result = sorted(weeks.values(), key=lambda x: x["_mon"])
+    return result
+
+def aggregate_monthly(all_daily: dict) -> list[dict]:
+    """Group daily data into calendar months."""
+    months: dict[str, dict] = {}
+    for date_str, v in all_daily.items():
+        key = date_str[:7]  # "YYYY-MM"
+        if key not in months:
+            months[key] = {"label": key, "tokens": 0.0, "cost": 0.0}
+        months[key]["tokens"] += v["tokens"]
+        months[key]["cost"]   += v["cost"]
+    return sorted(months.values(), key=lambda x: x["label"])
+
+# ── Primitive drawing ─────────────────────────────────────────────────────────
+def section(title: str, W: int) -> str:
+    side = (W - vlen(title) - 4) // 2
+    return f"{GRY2}{'─' * side}{RST} {BOLD}{WHT}{title}{RST} {GRY2}{'─' * (W - side - vlen(title) - 4)}{RST}"
+
+def hline(W: int, ch: str = "─", color: str = GRY2) -> str:
+    return f"{color}{ch * W}{RST}"
+
+def card(label: str, value: str, sub: str = "", width: int = 20, color: str = PUR) -> list[str]:
+    inner = width - 4
+    return [
+        f"{GRY2}┌{'─'*(width-2)}┐{RST}",
+        f"{GRY2}│{RST} {GRY}{vpad(label, inner)}{RST} {GRY2}│{RST}",
+        f"{GRY2}│{RST} {color}{BOLD}{vpad(value, inner)}{RST} {GRY2}│{RST}",
+        f"{GRY2}│{RST} {GRY}{vpad(sub, inner)}{RST} {GRY2}│{RST}",
+        f"{GRY2}└{'─'*(width-2)}┘{RST}",
+    ]
+
+def cards_row(cards_list: list[list[str]], indent: int = 2) -> list[str]:
+    rows = []
+    for cols in zip(*cards_list):
+        rows.append(" " * indent + "  ".join(cols))
+    return rows
+
+_BLOCKS = " ▁▂▃▄▅▆▇█"
+
+def vchart(values: list[float], height: int = 8, width: int = 60, color: str = PUR) -> list[str]:
+    if not values:
+        return [f"{GRY}(no data){RST}"] * (height + 1)
+    if len(values) > width:
+        step = len(values) / width
+        vals = [values[int(i * step)] for i in range(width)]
+    else:
+        vals = [0.0] * (width - len(values)) + list(values)
+    mx = max(vals) if max(vals) > 0 else 1.0
+    rows = []
+    for row in range(height, 0, -1):
+        threshold_hi = mx * row / height
+        threshold_lo = mx * (row - 1) / height
+        line = ""
+        for v in vals:
+            if v >= threshold_hi:
+                line += "█"
+            elif v >= threshold_lo:
+                frac = (v - threshold_lo) / (threshold_hi - threshold_lo)
+                line += _BLOCKS[max(1, int(frac * 8))]
+            else:
+                line += " "
+        rows.append(f"{GRY2}│{RST}{color}{line}{RST}")
+    rows.append(f"{GRY2}└{'─' * width}{RST}")
+    return rows
+
+def sparkline(values: list[float], width: int = 40, color: str = PUR) -> str:
+    if not values or max(values) == 0:
+        return f"{GRY}{'─' * width}{RST}"
+    mx = max(values)
+    step = len(values) / width if len(values) > width else 1
+    chars = []
+    for i in range(width):
+        v = values[min(int(i * step), len(values) - 1)] if len(values) > width else (values[i] if i < len(values) else 0)
+        chars.append(_BLOCKS[min(8, int(v / mx * 8))])
+    return f"{color}{''.join(chars)}{RST}"
+
+def pbar(pct: float, width: int = 20, color: str = PUR) -> str:
+    filled = int(min(pct, 100) / 100 * width)
+    return f"{color}{'█' * filled}{GRY2}{'░' * (width - filled)}{RST}"
+
+def impact_bar(val: float, max_val: float, width: int = 16, color: str = CYN) -> str:
+    if max_val <= 0:
+        return " " * width
+    pct = min(val / max_val, 1.0)
+    filled = int(pct * width)
+    return f"{color}{'█' * filled}{GRY2}{'░' * (width - filled)}{RST}"
+
+# ── Breakdown table helper ────────────────────────────────────────────────────
+def _period_table(rows: list[dict], label_col: str, W: int) -> list[str]:
+    """
+    Render a period breakdown table.
+    rows: list of {label, tokens, cost}
+    """
+    if not rows:
+        return [f"    {GRY}No data{RST}"]
+
+    total_tok  = sum(r["tokens"] for r in rows)
+    total_cost = sum(r["cost"]   for r in rows)
+    max_tok    = max(r["tokens"] for r in rows) or 1
+
+    LW, TW, CW, BW = 20, 14, 12, 16
+    sep = f"    {GRY2}{'─'*LW}{'─'*TW}{'─'*CW}{'─'*BW}{RST}"
+    out = []
+    out.append(
+        f"    "
+        f"{vpad(f'{GRY}{label_col}{RST}', LW)}"
+        f"{vpad(f'{GRY}Tokens Saved{RST}', TW)}"
+        f"{vpad(f'{GRY}Cost Saved{RST}', CW)}"
+        f"{GRY}Bar{RST}"
+    )
+    out.append(sep)
+
+    for r in rows:
+        tok_pct = r["tokens"] / max_tok * 100 if max_tok else 0
+        out.append(
+            f"    "
+            f"{vpad(WHT + r['label'] + RST, LW)}"
+            f"{vpad(PUR + fmt_tok(r['tokens']) + RST, TW)}"
+            f"{vpad(GRN + fmt_usd(r['cost']) + RST, CW)}"
+            f"{pbar(tok_pct, 14, PUR)}"
+        )
+
+    out.append(sep)
+    out.append(
+        f"    "
+        f"{vpad(BOLD + WHT + 'TOTAL' + RST, LW)}"
+        f"{vpad(f'{PUR}{BOLD}{fmt_tok(total_tok)}{RST}', TW)}"
+        f"{vpad(f'{GRN}{BOLD}{fmt_usd(total_cost)}{RST}', CW)}"
+    )
+    return out
+
+# ── Main render ───────────────────────────────────────────────────────────────
+def render(data: dict | None, days: int = 15) -> str:
+    W = min(term_width() - 2, 110)
+    out = []
+    add = out.append
+
+    # ── Header ──────────────────────────────────────────────────────────────
+    now = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+    title = "  HEADROOM · SAVINGS DASHBOARD  "
+    title_full = f"{BOLD}{WHT}{title}{RST}"
+    right  = f"{GRY}{now}{RST}"
+    inner  = W - 2
+    gap = inner - vlen(title_full) - vlen(right) - 2
+    add("")
+    add(f"  {PUR}╔{'═'*(inner)}╗{RST}")
+    add(f"  {PUR}║{RST} {title_full}{'  ' + right if gap >= 0 else ''}{' '*max(0,gap)}{PUR}║{RST}")
+    add(f"  {PUR}╚{'═'*(inner)}╝{RST}")
+    add("")
+
+    if data is None:
+        add(f"  {RED}✗  Headroom proxy is NOT running on port {PORT}.{RST}")
+        add(f"  {GRY}   Start it with:  headroom-proxy start{RST}")
+        add("")
+        return "\n".join(out)
+
+    s   = data["summary"]
+    ps  = data.get("persistent_savings", {})
+    lft = ps.get("lifetime", {})
+    cfg = data.get("config", {})
+    pi  = data.get("proxy_inbound", {})
+    sess = ps.get("display_session", {})
+    hist = ps.get("recent_history", [])
+    projects = ps.get("projects", {})
+    comp = s["compression"]
+    agent_usage = data.get("agent_usage", {}).get("agents", [])
+
+    # ── Overview cards ───────────────────────────────────────────────────────
+    tok_saved   = lft.get("tokens_saved", 0)
+    cost_saved  = lft.get("compression_savings_usd", 0)
+    req_total   = lft.get("requests", 0)
+    running     = True
+
+    proxy_pid = ""
+    try:
+        pidfile = os.path.expanduser("~/.headroom/proxy.pid")
+        if os.path.exists(pidfile):
+            proxy_pid = f"PID {open(pidfile).read().strip()}"
+    except Exception:
+        pass
+
+    status_val   = f"{GRN}● RUNNING{RST}"
+    status_sub   = proxy_pid or f"port {PORT}"
+
+    c1 = card("Tokens Saved",  f"{PUR}{BOLD}{fmt_tok(tok_saved)}{RST}",  "lifetime",       22, PUR)
+    c2 = card("Cost Saved",    f"{GRN}{BOLD}{fmt_usd(cost_saved)}{RST}", "lifetime",       22, GRN)
+    c3 = card("Requests",      f"{CYN}{BOLD}{req_total:,}{RST}",         "lifetime",       18, CYN)
+    c4 = card("Proxy",         status_val,                                 status_sub,       18)
+
+    add(f"  {BOLD}{WHT}Overview{RST}")
+    add("")
+    for line in cards_row([c1, c2, c3, c4]):
+        add(line)
+    add("")
+
+    # ── This Session ─────────────────────────────────────────────────────────
+    add(f"  {section('This Session', W)}")
+    add("")
+
+    sess_req  = sess.get("requests", 0)
+    sess_tok  = sess.get("tokens_saved", 0)
+    sess_cost = sess.get("compression_savings_usd", 0)
+    sess_pct  = sess.get("savings_percent", 0)
+    sess_in   = sess.get("total_input_tokens", 0)
+    sess_started = fmt_ts(sess.get("started_at", ""))
+    sess_last    = fmt_ts(sess.get("last_activity_at", ""))
+
+    cur_req  = s.get("api_requests", 0)
+    cur_comp = comp.get("requests_compressed", 0)
+    cur_avg  = comp.get("avg_compression_pct", 0.0)
+    cur_best = comp.get("best_compression_pct", 0.0)
+    cur_best_detail = comp.get("best_detail", "")
+
+    cols = [
+        f"{GRY}Requests{RST}  {CYN}{BOLD}{sess_req:,}{RST}",
+        f"{GRY}Tokens Saved{RST}  {PUR}{BOLD}{fmt_tok(sess_tok)}{RST}",
+        f"{GRY}Cost Saved{RST}  {GRN}{BOLD}{fmt_usd(sess_cost)}{RST}",
+        f"{GRY}Savings%{RST}  {YEL}{BOLD}{fmt_pct(sess_pct)}{RST}",
+        f"{GRY}Input Tokens{RST}  {GRY}{fmt_tok(sess_in)}{RST}",
+    ]
+    add("    " + f"  {GRY2}│{RST}  ".join(cols))
+    add("")
+
+    if cur_req > 0:
+        ratio = cur_comp / cur_req if cur_req else 0
+        add(
+            f"    {GRY}Compressed{RST}  {PUR}{cur_comp}/{cur_req}{RST} requests  "
+            f"{pbar(ratio * 100, 16)}  "
+            f"{GRY}Avg{RST} {CYN}{cur_avg:.1f}%{RST}  "
+            f"{GRY}Best{RST} {PUR}{cur_best:.1f}%{RST} {GRY}({cur_best_detail}){RST}"
+        )
+        if sess_started:
+            add(f"    {GRY}Started {sess_started}   Last activity {sess_last}{RST}")
+    else:
+        add(f"    {GRY}No inference requests yet — proxy is ready, compression starts after turn 2+{RST}")
+    add("")
+
+    # ── Savings Over Time ────────────────────────────────────────────────────
+    tok_deltas, cost_deltas, t_start, t_end = load_savings_chart_data()
+    if tok_deltas:
+        add(f"  {section('Savings Over Time', W)}")
+        add("")
+
+        chart_w = W - 14
+        chart_h = 7
+
+        date_label = f"{GRY}{t_start}  →  {t_end}{RST}"
+        max_tok = max(tok_deltas) if tok_deltas else 1
+        tok_chart = vchart(tok_deltas, chart_h, chart_w, PUR)
+
+        add(f"    {BOLD}{WHT}Tokens Saved / interval{RST}  {GRY}(max {fmt_tok(max_tok)} per point){RST}  {date_label}")
+        add("")
+
+        for i, row in enumerate(tok_chart):
+            if i < chart_h:
+                level = max_tok * (chart_h - i) / chart_h
+                lbl = vpad(f"{GRY}{fmt_tok(level):>6}{RST}", 8)
+            else:
+                lbl = vpad(f"{GRY}{'0':>6}{RST}", 8)
+            add(f"    {lbl} {row}")
+        add("")
+
+        max_cost = max(cost_deltas) if cost_deltas else 1
+        add(
+            f"    {BOLD}{WHT}Cost Saved / interval{RST}  "
+            f"{GRY}max {fmt_usd(max_cost)}/pt{RST}    "
+            f"  {sparkline(cost_deltas, chart_w, GRN)}"
+        )
+        add("")
+
+    # ── By Command (RTK) ─────────────────────────────────────────────────────
+    rtk_cmds = load_rtk_commands(15)
+    add(f"  {section('By Command  (RTK)', W)}")
+    add("")
+    if rtk_cmds:
+        max_saved = rtk_cmds[0]["saved"] if rtk_cmds else 1
+        # Header
+        NW, CW2, SW, PW, TW2, IW = 36, 7, 9, 8, 8, 16
+        add(
+            f"    {GRY}{'#':>2}  "
+            f"{vpad('Command', NW)}  "
+            f"{'Count':>{CW2}}  "
+            f"{'Saved':>{SW}}  "
+            f"{'Avg%':>{PW}}  "
+            f"{'Time':>{TW2}}  "
+            f"Impact{RST}"
+        )
+        add(f"    {GRY2}{'─'*2}  {'─'*NW}  {'─'*CW2}  {'─'*SW}  {'─'*PW}  {'─'*TW2}  {'─'*IW}{RST}")
+
+        for idx, r in enumerate(rtk_cmds, 1):
+            pct = r["avg_pct"]
+            pct_c = GRN if pct >= 70 else (YEL if pct >= 40 else RED)
+            bar = impact_bar(r["saved"], max_saved, IW, CYN)
+            cmd_str  = f"{WHT}{BOLD}{r['cmd']}{RST}"
+            cnt_str  = f"{CYN}{r['count']:>{CW2},}{RST}"
+            sav_str  = f"{PUR}{fmt_tok(r['saved']):>{SW}}{RST}"
+            pct_str  = f"{pct_c}{pct:>{PW-1}.1f}%{RST}"
+            time_str = f"{GRY}{fmt_ms(r['avg_ms']):>{TW2}}{RST}"
+            add(
+                f"    {GRY}{idx:>2}{RST}  "
+                f"{vpad(cmd_str, NW)}  "
+                f"{vpad(cnt_str, CW2+4)}  "
+                f"{vpad(sav_str, SW+4)}  "
+                f"{vpad(pct_str, PW+4)}  "
+                f"{vpad(time_str, TW2+4)}  "
+                f"{bar}"
+            )
+        add("")
+    else:
+        add(f"    {GRY}No RTK command data yet — run rtk commands to populate.{RST}")
+        add("")
+
+    # ── Per-Project breakdown ────────────────────────────────────────────────
+    if projects:
+        add(f"  {section('Per-Project Breakdown', W)}")
+        add("")
+
+        max_pname  = max(len(p) for p in projects)
+        col_p      = max(max_pname, 12)
+        total_tok  = sum(v.get("tokens_saved", 0) for v in projects.values())
+        total_cost = sum(v.get("compression_savings_usd", 0) for v in projects.values())
+        total_req  = sum(v.get("requests", 0) for v in projects.values())
+
+        h1 = vpad(f"{GRY}{'Project'}{RST}", col_p + 4)
+        h2 = vpad(f"{GRY}{'Requests':>9}{RST}", 13)
+        h3 = vpad(f"{GRY}{'Tokens Saved':>13}{RST}", 17)
+        h4 = vpad(f"{GRY}{'Cost Saved':>10}{RST}", 14)
+        h5 = vpad(f"{GRY}{'Savings':>8}{RST}", 12)
+        add(f"    {h1}{h2}{h3}{h4}{h5}  Share")
+        add(f"    {GRY2}{'─' * (col_p + 4)}{'─'*13}{'─'*17}{'─'*14}{'─'*12}  {'─'*22}{RST}")
+
+        sorted_proj = sorted(projects.items(), key=lambda x: x[1].get("tokens_saved", 0), reverse=True)
+        for pname, pd in sorted_proj:
+            preqs  = pd.get("requests", 0)
+            ptok   = pd.get("tokens_saved", 0)
+            pcost  = pd.get("compression_savings_usd", 0)
+            ppct   = pd.get("savings_percent", 0)
+            share  = ptok / total_tok * 100 if total_tok else 0
+            pct_c  = GRN if ppct >= 20 else (YEL if ppct >= 10 else CYN)
+
+            c_name = vpad(f"{WHT}{pname}{RST}", col_p + 4)
+            c_req  = vpad(f"{CYN}{preqs:>9,}{RST}", 13)
+            c_tok  = vpad(f"{PUR}{fmt_tok(ptok):>13}{RST}", 17)
+            c_cost = vpad(f"{GRN}{fmt_usd(pcost):>10}{RST}", 14)
+            c_pct  = vpad(f"{pct_c}{ppct:>7.1f}%{RST}", 12)
+            bar_str = pbar(share, 20)
+            add(f"    {c_name}{c_req}{c_tok}{c_cost}{c_pct}  {bar_str} {GRY}{share:.0f}%{RST}")
+
+        add(f"    {GRY2}{'─' * (col_p + 4)}{'─'*13}{'─'*17}{'─'*14}{'─'*12}{'─'*24}{RST}")
+        t_name = vpad(f"{BOLD}{WHT}TOTAL{RST}", col_p + 4)
+        t_req  = vpad(f"{CYN}{BOLD}{total_req:>9,}{RST}", 13)
+        t_tok  = vpad(f"{PUR}{BOLD}{fmt_tok(total_tok):>13}{RST}", 17)
+        t_cost = vpad(f"{GRN}{BOLD}{fmt_usd(total_cost):>10}{RST}", 14)
+        add(f"    {t_name}{t_req}{t_tok}{t_cost}")
+        add("")
+
+    # ── Daily Breakdown ──────────────────────────────────────────────────────
+    daily = load_daily(days)
+    if daily:
+        add(f"  {section(f'Daily Breakdown  (last {days} days)', W)}")
+        add("")
+
+        sorted_dates = sorted(daily.keys())
+        all_tok_vals  = [daily[d]["tokens"] for d in sorted_dates]
+        all_cost_vals = [daily[d]["cost"]   for d in sorted_dates]
+        max_day_tok   = max(all_tok_vals)  if all_tok_vals  else 1
+        max_day_cost  = max(all_cost_vals) if all_cost_vals else 1
+
+        DW, TW, CW, BW = 15, 15, 13, 24
+        sep = f"    {GRY2}{'─'*DW}{'─'*TW}{'─'*CW}{'─'*BW}{RST}"
+
+        add(f"    "
+            f"{vpad(f'{GRY}Date{RST}', DW)}"
+            f"{vpad(f'{GRY}Tokens Saved{RST}', TW)}"
+            f"{vpad(f'{GRY}Cost Saved{RST}', CW)}"
+            f"{GRY}Token bar  Cost bar{RST}")
+        add(sep)
+
+        for date_str in sorted_dates:
+            d   = daily[date_str]
+            tok_pct  = d["tokens"] / max_day_tok  * 100 if max_day_tok  else 0
+            cost_pct = d["cost"]   / max_day_cost * 100 if max_day_cost else 0
+            b_tok  = pbar(tok_pct,  10, PUR)
+            b_cost = pbar(cost_pct, 10, GRN)
+            tok_s  = fmt_tok(d["tokens"])
+            cost_s = fmt_usd(d["cost"])
+            add(
+                f"    "
+                f"{vpad(WHT + date_str + RST, DW)}"
+                f"{vpad(PUR + tok_s + RST, TW)}"
+                f"{vpad(GRN + cost_s + RST, CW)}"
+                f"{b_tok}  {b_cost}"
+            )
+
+        add(sep)
+        total_daily_tok  = sum(d["tokens"] for d in daily.values())
+        total_daily_cost = sum(d["cost"]   for d in daily.values())
+        add(
+            f"    "
+            f"{vpad(BOLD + WHT + 'Window total' + RST, DW)}"
+            f"{vpad(f'{PUR}{BOLD}{fmt_tok(total_daily_tok)}{RST}', TW)}"
+            f"{vpad(f'{GRN}{BOLD}{fmt_usd(total_daily_cost)}{RST}', CW)}"
+        )
+
+        add("")
+        spark_w = max(len(sorted_dates) * 6, 24)
+        add(f"    {GRY}Tokens / day{RST}  {sparkline(all_tok_vals,  spark_w, PUR)}")
+        add(f"    {GRY}Cost   / day{RST}  {sparkline(all_cost_vals, spark_w, GRN)}")
+        add(f"    {GRY}Range: {sorted_dates[0]}  →  {sorted_dates[-1]}{RST}")
+        add("")
+
+    # ── Weekly Breakdown ─────────────────────────────────────────────────────
+    all_daily = load_all_daily()
+    weekly = aggregate_weekly(all_daily)
+    if weekly:
+        add(f"  {section(f'Weekly Breakdown  ({len(weekly)} weeks)', W)}")
+        add("")
+        for line in _period_table(weekly, "Week", W):
+            add(line)
+        add("")
+
+    # ── Monthly Breakdown ────────────────────────────────────────────────────
+    monthly = aggregate_monthly(all_daily)
+    if monthly:
+        add(f"  {section(f'Monthly Breakdown  ({len(monthly)} months)', W)}")
+        add("")
+        for line in _period_table(monthly, "Month", W):
+            add(line)
+        add("")
+
+    # ── Agent Usage ──────────────────────────────────────────────────────────
+    if agent_usage:
+        add(f"  {section('Agent Usage  (this session)', W)}")
+        add("")
+        for ag in agent_usage:
+            label = ag.get("label", ag.get("agent", "?"))
+            reqs  = ag.get("requests", 0)
+            before = ag.get("before_tokens", 0)
+            after  = ag.get("after_tokens", 0)
+            saved  = ag.get("tokens_saved", 0)
+            pct    = ag.get("savings_percent", 0.0)
+            models = ", ".join(ag.get("models", {}).keys())
+            add(
+                f"    {WHT}{BOLD}{label:<18}{RST}  "
+                f"{GRY}reqs{RST} {CYN}{reqs:>4}{RST}  "
+                f"{GRY}before{RST} {GRY}{fmt_tok(before):>7}{RST}  "
+                f"{GRY}after{RST} {GRY}{fmt_tok(after):>7}{RST}  "
+                f"{GRY}saved{RST} {PUR}{fmt_tok(saved):>7}{RST}  "
+                f"{GRY}savings{RST} {YEL}{pct:.1f}%{RST}  "
+                f"{GRY}{models}{RST}"
+            )
+        add("")
+
+    # ── Active Config ────────────────────────────────────────────────────────
+    add(f"  {section('Active Config', W)}")
+    add("")
+
+    def flag(v, on="ON", off="OFF"):
+        if v in (True, 1, "1", "strict", "true"):
+            return f"{GRN}{on}{RST}"
+        if v in (False, 0, "0", None, "false"):
+            return f"{GRY}{off}{RST}"
+        return f"{CYN}{v}{RST}"
+
+    def cv(v, unit=""):
+        return f"{CYN}{v}{unit}{RST}" if v is not None else f"{GRY}—{RST}"
+
+    mode        = s.get("mode", "token")
+    profile     = cfg.get("savings_profile")
+    target      = cfg.get("target_savings_percent")
+    min_tokens  = cfg.get("min_tokens_to_crush")
+    max_items   = cfg.get("max_items_after_crush")
+    protect_rec = cfg.get("protect_recent")
+
+    # Detect actual memory state
+    mem_on = is_memory_on()
+
+    LW, VW, GAP = 16, 11, 4
+
+    def cfg_row(*pairs):
+        parts = []
+        for lbl, val in pairs:
+            parts.append(vpad(f"{GRY}{lbl}{RST}", LW) + "  " + vpad(val, VW))
+        return "    " + (" " * GAP).join(parts)
+
+    add(cfg_row(
+        ("Code-Aware",     flag(True)),
+        ("Auto Memory",    flag(mem_on)),
+        ("Telemetry",      flag(False, "ON", "OFF")),
+    ))
+    add(cfg_row(
+        ("Force Kompress", flag(cfg.get("force_kompress"))),
+        ("Accuracy Guard", cv(cfg.get("accuracy_guard"))),
+        ("Smart Crusher",  flag(cfg.get("smart_crusher_with_compaction"))),
+    ))
+    add(cfg_row(
+        ("Mode",           cv(mode)),
+        ("Profile",        cv(profile)),
+        ("Target",         cv(f"{int(target)}%" if target else None)),
+    ))
+    add(cfg_row(
+        ("Compress User",  flag(cfg.get("compress_user_messages"))),
+        ("Compress Sys",   flag(cfg.get("compress_system_messages"))),
+        ("Protect Recent", f"{CYN}{protect_rec}{RST} {GRY}turns{RST}" if protect_rec else cv(None)),
+    ))
+    add(cfg_row(
+        ("Min Tokens",     cv(min_tokens)),
+        ("Max Items",      cv(max_items)),
+    ))
+    add("")
+
+    # ── Proxy inbound ────────────────────────────────────────────────────────
+    add(f"  {section('Proxy  (this session)', W)}")
+    add("")
+
+    inbound_total  = pi.get("total", 0)
+    inference_hits = pi.get("by_path", {}).get("/v1/messages", 0)
+    by_status      = pi.get("by_status", {})
+
+    status_str = "  ".join(f"{GRY}{code}{RST} {CYN}{n}{RST}" for code, n in sorted(by_status.items()))
+    add(
+        f"    {GRY}Total inbound{RST}  {CYN}{inbound_total:,}{RST}  "
+        f"  {GRY}/v1/messages{RST}  {PUR}{BOLD}{inference_hits}{RST}  "
+        f"  {GRY}status codes{RST}  {status_str or GRY + 'none yet' + RST}  "
+        f"  {GRY}endpoint{RST}  {GRY}http://localhost:{PORT}{RST}"
+    )
+    add("")
+
+    # ── Footer ───────────────────────────────────────────────────────────────
+    add(f"  {hline(W)}")
+    cmds = [
+        f"{GRY}headroom-proxy start{RST}",
+        f"{GRY}headroom-proxy stop{RST}",
+        f"{GRY}headroom-proxy status{RST}",
+        f"{GRY}headroom-stats --watch{RST}",
+        f"{GRY}curl http://localhost:{PORT}/stats{RST}",
+    ]
+    add("  " + f"  {GRY2}·{RST}  ".join(cmds))
+    add("")
+
+    return "\n".join(out)
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+def main():
+    args = sys.argv[1:]
+    watch = False
+    interval = 5
+    days = 15
+
+    for arg in args:
+        if arg in ("--watch", "-w"):
+            watch = True
+        elif arg.startswith("--watch="):
+            watch = True
+            interval = int(arg.split("=", 1)[1])
+        elif arg.startswith("--days="):
+            days = int(arg.split("=", 1)[1])
+        elif arg in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+
+    if watch:
+        try:
+            while True:
+                os.system("clear")
+                print(render(fetch(), days))
+                print(f"  {GRY}Auto-refresh every {interval}s  ·  Ctrl-C to quit{RST}\n")
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            print(f"\n  {GRY}Bye!{RST}\n")
+    else:
+        print(render(fetch(), days))
+
+if __name__ == "__main__":
+    main()
