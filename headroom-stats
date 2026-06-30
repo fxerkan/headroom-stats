@@ -19,6 +19,11 @@ from datetime import datetime, date, timedelta, timezone
 from urllib.request import urlopen
 
 # ── Config ────────────────────────────────────────────────────────────────────
+VERSION = "1.1.0"
+REPO    = "fxerkan/headroom-stats"
+REPO_SCRIPT_URL = f"https://raw.githubusercontent.com/{REPO}/main/headroom-stats"
+REPO_INSTALL_DIR = os.path.expanduser("~/repo_local/headroom-stats")
+
 PORT = int(os.environ.get("HEADROOM_PORT", "8787"))
 STATS_URL = f"http://localhost:{PORT}/stats"
 RTK_DB = os.path.expanduser("~/Library/Application Support/rtk/history.db")
@@ -92,6 +97,40 @@ def fmt_ts(ts: str, fmt: str = "%Y-%m-%d %H:%M") -> str:
     if is_utc:
         dt = dt.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
     return dt.strftime(fmt)
+
+def check_latest_version() -> str | None:
+    """Return latest version string from GitHub, or None on failure. Fast 1s timeout."""
+    try:
+        with urlopen(REPO_SCRIPT_URL, timeout=1) as r:
+            for line in r:
+                text = line.decode("utf-8", errors="ignore").strip()
+                if text.startswith("VERSION"):
+                    return text.split('"')[1]
+    except Exception:
+        pass
+    return None
+
+def self_update() -> None:
+    """Pull latest version from git repo and copy to this script's location."""
+    import shutil, subprocess
+    script_path = os.path.abspath(__file__)
+    print(f"\n  {GRY}Updating headroom-stats…{RST}\n")
+    if os.path.isdir(REPO_INSTALL_DIR):
+        res = subprocess.run(["git", "pull"], cwd=REPO_INSTALL_DIR, capture_output=True, text=True)
+        if res.returncode == 0:
+            src = os.path.join(REPO_INSTALL_DIR, "headroom-stats")
+            shutil.copy2(src, script_path)
+            os.chmod(script_path, 0o755)
+            print(f"  {GRN}✓ Updated to latest version.{RST}\n")
+        else:
+            print(f"  {RED}✗ git pull failed:{RST}\n{res.stderr}\n")
+    else:
+        print(f"  {RED}✗ Repo not found at {REPO_INSTALL_DIR}{RST}")
+        print(f"  {GRY}  Clone it first: git clone https://github.com/{REPO}.git {REPO_INSTALL_DIR}{RST}\n")
+
+def hyperlink(url: str, text: str) -> str:
+    """OSC 8 clickable terminal hyperlink."""
+    return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
 
 def fetch() -> dict | None:
     try:
@@ -391,7 +430,7 @@ def _period_table(rows: list[dict], label_col: str, W: int) -> list[str]:
     return out
 
 # ── Main render ───────────────────────────────────────────────────────────────
-def render(data: dict | None, days: int = 15) -> str:
+def render(data: dict | None, days: int = 15, latest_version: str | None = None) -> str:
     W = min(term_width() - 2, 110)
     out = []
     add = out.append
@@ -794,9 +833,32 @@ def render(data: dict | None, days: int = 15) -> str:
         f"{GRY}headroom-proxy stop{RST}",
         f"{GRY}headroom-proxy status{RST}",
         f"{GRY}headroom-stats --watch{RST}",
-        f"{GRY}curl http://localhost:{PORT}/stats{RST}",
+        f"{GRY}headroom-stats --update{RST}",
     ]
     add("  " + f"  {GRY2}·{RST}  ".join(cmds))
+    add("")
+    add(f"  {hline(W)}")
+    add("")
+
+    # Version + update notice
+    ver_str = f"{GRY2}v{VERSION}{RST}"
+    if latest_version and latest_version != VERSION:
+        update_note = (
+            f"  {YEL}⬆  New version available: {BOLD}v{latest_version}{RST}{YEL}"
+            f"  →  headroom-stats --update{RST}"
+        )
+        add(update_note)
+    add(f"  {ver_str}  {GRY2}·{RST}  "
+        f"{GRY}{hyperlink(f'https://github.com/{REPO}', 'github.com/' + REPO)}{RST}")
+    add("")
+
+    # Slogan + attribution
+    gh_link = hyperlink("https://github.com/fxerkan", f"{CYN}@fxerkan{RST}")
+    add(
+        f"  {GRY2}code more, worry less{RST}"
+        f"  {GRY2}·{RST}"
+        f"  {GRY}developed by {gh_link} {GRY}with AI{RST}"
+    )
     add("")
 
     return "\n".join(out)
@@ -816,21 +878,34 @@ def main():
             interval = int(arg.split("=", 1)[1])
         elif arg.startswith("--days="):
             days = int(arg.split("=", 1)[1])
+        elif arg in ("--update", "-u"):
+            self_update()
+            sys.exit(0)
         elif arg in ("-h", "--help"):
             print(__doc__)
             sys.exit(0)
 
+    # Check latest version in background (non-blocking via thread)
+    import threading
+    latest_version: list[str | None] = [None]
+    def _check():
+        latest_version[0] = check_latest_version()
+    t = threading.Thread(target=_check, daemon=True)
+    t.start()
+
     if watch:
+        t.join(timeout=1.5)
         try:
             while True:
                 os.system("clear")
-                print(render(fetch(), days))
+                print(render(fetch(), days, latest_version[0]))
                 print(f"  {GRY}Auto-refresh every {interval}s  ·  Ctrl-C to quit{RST}\n")
                 time.sleep(interval)
         except KeyboardInterrupt:
             print(f"\n  {GRY}Bye!{RST}\n")
     else:
-        print(render(fetch(), days))
+        t.join(timeout=1.5)
+        print(render(fetch(), days, latest_version[0]))
 
 if __name__ == "__main__":
     main()
